@@ -1,0 +1,15 @@
+<?lua
+local dosomething = 13.37
+?><html>
+<head><title>Hello world!</title></head>
+<body>
+<center><h1><?lua print"Hello world!" ?></h1></center>
+<hr><center><?lua print(_VERSION, jit.os, jit.arch, jit.version) ?></center>
+<?lua
+local dix = true
+if dix then
+	print(dosomething, dosomething == 13.37, "\r\n")
+end
+?>
+</body>
+</html>
