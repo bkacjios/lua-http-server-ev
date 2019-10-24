@@ -1,15 +1,39 @@
 <?lua
-local dosomething = 13.37
+local socket = require("socket")
+local sqlite = require("lsqlite3")
+
+local db = sqlite.open("/home/jake/bots/twitch/twitch.db")
+
+local start = socket.gettime()
 ?><html>
 <head><title>Hello world!</title></head>
 <body>
-<center><h1><?lua print"Hello world!" ?></h1></center>
-<hr><center><?lua print(_VERSION, jit.os, jit.arch, jit.version) ?></center>
 <?lua
-local dix = true
-if dix then
-	print(dosomething, dosomething == 13.37, "\r\n")
+--[[for k,v in pairs(_REQUEST:getheaders()) do
+	echo(string.format("%s: %s</br>\r\n", k, v))
+end]]
+?>
+<center><h1>TWITCH STATS</h1></center>
+<table>
+	<tr><th>ROOM#</th><th>users</th><th>size</th></tr>
+<?lua
+local stmt = db:prepare("SELECT room_id, COUNT(user_id), SUM(size) FROM sizes GROUP BY room_id;")
+
+if stmt then
+	for room_id, num_users, total_size in stmt:urows() do
+		echo(string.format([[	<tr><td>%s</td><td>%s</td><td>%s</td></tr>
+]], room_id, num_users, total_size))
+	end
+	stmt:finalize()
 end
 ?>
+</table>
+<hr><center><?lua echo(_VERSION, jit.os, jit.arch, jit.version) ?></center>
+<?lua
+local time = socket.gettime() - start
+
+echo(string.format("Query took %f seconds", time))
+?>
+<?= $_VERSION ?>
 </body>
 </html>

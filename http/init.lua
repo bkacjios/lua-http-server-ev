@@ -1,14 +1,10 @@
 local http = {}
 
-local HTTP_VERSION = "HTTP/2.0"
-local HTTP_LINE_ENDINGS = "\r\n"
-local HTTP_KEEP_ALIVE_TIMEOUT = 30
-local HTTP_RESPOND_WITH_ERRORS = true
-
 local ev = require("ev")
 local log = require("log")
 local socket = require("socket")
 local url = require("socket.url")
+local ssl = require("ssl")
 
 local insert = table.insert
 local remove = table.remove
@@ -25,6 +21,8 @@ local date = os.date
 local bind = socket.bind
 local gettime = socket.gettime
 
+local HTTP_VERSION = "HTTP/2.0"
+
 local CLIENT = {}
 CLIENT.__index = CLIENT
 
@@ -40,6 +38,8 @@ function CLIENT:createrequest(method, uri, headers)
 		method = method,
 		url = url.parse(uri), 
 		headers = headers,
+		client = self,
+		server = self.server,
 	}, REQUEST)
 end
 
@@ -69,10 +69,12 @@ RESPONSE.__index = RESPONSE
 function CLIENT:createresponse()
 	return setmetatable({
 		code = 200,
+		client = self,
+		server = self.server,
 		headers = {
 			["Server"] = http.server_version_string(),
 			["Connection"] = "Keep-Alive",
-			["Keep-Alive"] = self:gettimeout(),
+			["Keep-Alive"] = format("timeout=%d, max=%d", self:gettimeout(), self:getmaxrequests()),
 			["Date"] = date("!%a, %d %b %Y %H:%M:%S %Z"),
 			["Content-Length"] = 0,
 		},
@@ -109,19 +111,45 @@ function RESPONSE:getheaders()
 	return self.headers
 end
 
-function RESPONSE:format()
-	--[[local response = concat({
-		format("%s %s", HTTP_VERSION, http.status(code)),
-		format("Server: %s", http.server_version_string()),
-		format("Content-Type: %s", (mime or "text/html")),
-		format("Content-Length: %d", #document),
-		"Connection: Keep-Alive",
-		format("Keep-Alive: timeout=%d", self:gettimeout()),
-		format("Date: %s", date("!%a, %d %b %Y %H:%M:%S %Z")),
-		"",
-		document
-	}, HTTP_LINE_ENDINGS)]]
+function RESPONSE:displayerrorpage(err)
+	local document = [[<html>
+<head><title>{status}</title>
+<style>.container{text-align:center;}.container pre{display:inline-block;text-align:left;}
+</style></head>
+<body>
+<center><h1>{status}</h1></center>
+<div class="container"><pre>{error}</pre></div>
+<hr><center>{server-version}</center>
+</body>
+</html>]]
 
+	-- Replace some keys with their values
+	document = document:gsub("%{error%}", err)
+	document = document:gsub("%{status%}", http.status(self:getcode()))
+	document = document:gsub("%{server%-version%}", http.server_version_string())
+
+	self:setdocument(document)
+end
+
+function RESPONSE:displaystatuspage(code)
+	local document = [[<html>
+<head><title>{status}</title></head>
+<body>
+<center><h1>{status}</h1></center>
+<hr><center>{server-version}</center>
+</body>
+</html>]]
+
+	if code then self:setcode(code) end
+
+	-- Replace some keys with their values
+	document = document:gsub("%{status%}", http.status(self:getcode()))
+	document = document:gsub("%{server%-version%}", http.server_version_string())
+
+	self:setdocument(document)
+end
+
+function RESPONSE:format()
 	local response = {
 		format("%s %s", HTTP_VERSION, http.status(self:getcode()))
 	}
@@ -133,11 +161,19 @@ function RESPONSE:format()
 	insert(response, "") -- Signal for document
 	insert(response, self:getdocument())
 
-	local response_str = concat(response, HTTP_LINE_ENDINGS)
+	local response_str = concat(response, self.server:getlineendings())
 
 	log.debug("RESPONSE %s", response_str)
 
 	return response_str
+end
+
+function CLIENT:setmaxrequests(max)
+	self.maxrequests = max
+end
+
+function CLIENT:getmaxrequests()
+	return self.maxrequests
 end
 
 function CLIENT:settimeout(time)
@@ -161,6 +197,14 @@ function CLIENT:readrequest()
 	log.debug("REQUEST %s %s %s", method, uri, httpver)
 
 	local headers = self:readheaders()
+
+	local header_debug = ""
+
+	for key, value in pairs(headers) do
+		header_debug = header_debug .. format("%s:%s\r\n", key, value)
+	end
+
+	log.debug("HEADERS\r\n%s", header_debug)
 
 	local request = self:createrequest(method, uri, headers)
 	local response = self:createresponse()
@@ -220,11 +264,88 @@ function CLIENT:close()
 	log.info("http client [%s:%i] connection closed", self.ip, self.port)
 end
 
+--[[
+	SERVER METATABLE
+]]
+
 local SERVER = {}
 SERVER.__index = SERVER
 
+function http.create(ip, port, params)
+	local socket = assert(bind(ip, port))
+	socket:settimeout(0)
+
+	local ip, port = socket:getsockname()
+
+	log.info("http server started @%s:%i", ip, port)
+
+	local server = setmetatable({
+			ip = ip,
+			port = port,
+			socket = socket,
+			ssl_ctx = assert(ssl.newcontext(params)),
+			hooks = {},
+			loop = ev.Loop.default,
+			line_endings = "\r\n",
+			client_timeout = 30,
+			client_maxrequests = 100,
+			respond_with_errors = true,
+	}, SERVER)
+
+	-- Create an event using the sockets file desciptor for when client is ready to read data
+	server.onread = ev.IO.new(function()
+		local succ, err = xpcall(server.acceptclients, debug.traceback, server)
+		if not succ then log.error(err) end
+	end, server:getfd(), ev.READ)
+
+	return server
+end
+
 function SERVER:getfd()
 	return self.socket:getfd()
+end
+
+function SERVER:start(loop)
+	self.loop = loop or self.loop
+
+	-- Register the event
+	self.onread:start(self.loop)
+end
+
+function SERVER:getloop()
+	return self.loop
+end
+
+function SERVER:setlineendings(endings)
+	self.line_endings = endings
+end
+
+function SERVER:getlineendings()
+	return self.line_endings
+end
+
+function SERVER:setclientmaxrequests(max)
+	self.client_maxrequests = max
+end
+
+function SERVER:getclientmaxrequests()
+	return self.client_maxrequests
+end
+
+function SERVER:setclienttimeout(timeout)
+	self.client_timeout = timeout
+end
+
+function SERVER:getclienttimeout()
+	return self.client_timeout
+end
+
+function SERVER:setrespondwitherrors(b)
+	self.respond_with_errors = b
+end
+
+function SERVER:getrespondwitherrors()
+	return self.respond_with_errors
 end
 
 function SERVER:acceptclients()
@@ -235,10 +356,15 @@ function SERVER:acceptclients()
 
 		if not client then break end
 
-		-- Make non-blocking
-		client:settimeout(0)
+		--[[client = assert(ssl.wrap(client, self.ssl_ctx))
+		local status, err = client:dohandshake()
+
+		if not status then break end]]
 
 		local ip, port = client:getpeername()
+
+		-- Make non-blocking
+		client:settimeout(0)
 
 		local client = setmetatable({
 			ip = ip,
@@ -246,8 +372,10 @@ function SERVER:acceptclients()
 			socket = client,
 			server = self,
 			headers = {},
-			keepalive = true,
-			timeout = HTTP_KEEP_ALIVE_TIMEOUT,
+			--keepalive = true, -- TODO: Should we provide an option to close connections immediately? Probbaly not..
+			timeout = self:getclienttimeout(), -- How long to keep an active client connection alive
+			maxrequests = self:getclientmaxrequests(),
+			loop = self.loop,
 		}, CLIENT)
 
 		-- Create an event timer to timeout the connection
@@ -257,7 +385,7 @@ function SERVER:acceptclients()
 		end, client.timeout, 0)
 
 		-- Register the timer
-		client.timer:start(ev.Loop.default)
+		client.timer:start(self.loop)
 
 		-- Create an event using the sockets file desciptor for when client is ready to read data
 		client.onread = ev.IO.new(function()
@@ -267,7 +395,7 @@ function SERVER:acceptclients()
 		end, client:getfd(), ev.READ)
 
 		-- Register the event
-		client.onread:start(ev.Loop.default)
+		client.onread:start(self.loop)
 
 		log.info("http client [%s:%i] connected", ip, port)
 	end
@@ -287,19 +415,18 @@ function SERVER:call(request, response)
 
 			response:setcode(500) -- Set response code to "Internal Server Error"
 
-			if HTTP_RESPOND_WITH_ERRORS then
+			if self:getrespondwitherrors() then
 				-- Respond with a detailed error page
-				response:setdocument(http.error_page(500, code)) -- The "code" variable is actually the error string
+				response:displayerrorpage(code) -- The "code" variable is actually the error string
 			else
-				-- Respond with a generic/nondescript error page
-				response:setdocument(http.status_page(500))
+				response:displaystatuspage() -- Respond with a generic/nondescript error page
 			end
 		elseif code then
 			response:setcode(code)
 		end
 	else
 		response:setcode(501) -- Set response code to "Not Implemented"
-		response:setdocument(http.status_page(501))
+		response:displaystatuspage()
 	end
 end
 
@@ -308,81 +435,83 @@ function SERVER:close()
 	log.info("http server closed")
 end
 
-local status_translate = {
-	[100] = "Continue",
-	[101] = "Switching Protocol",
-	[102] = "Processing",
-	[103] = "Early Hints",
+do
+	local status_translate = {
+		[100] = "Continue",
+		[101] = "Switching Protocol",
+		[102] = "Processing",
+		[103] = "Early Hints",
 
-	[200] = "OK",
-	[201] = "Created",
-	[202] = "Accepted",
-	[203] = "Non-Authoritative Information",
-	[204] = "No Content",
-	[205] = "Reset Content",
-	[206] = "Partial Content",
-	[207] = "Multi-Status",
-	[208] = "Multi-Status",
-	[226] = "IM Used",
+		[200] = "OK",
+		[201] = "Created",
+		[202] = "Accepted",
+		[203] = "Non-Authoritative Information",
+		[204] = "No Content",
+		[205] = "Reset Content",
+		[206] = "Partial Content",
+		[207] = "Multi-Status",
+		[208] = "Multi-Status",
+		[226] = "IM Used",
 
-	[300] = "Multiple Choice",
-	[301] = "Moved Permanently",
-	[302] = "Found",
-	[303] = "See Other",
-	[304] = "Not Modified",
-	[305] = "Use Proxy", -- Deprecated
-	[306] = "Unused", -- Unused
-	[307] = "Temporary Redirect",
-	[308] = "Permanent Redirect",
+		[300] = "Multiple Choice",
+		[301] = "Moved Permanently",
+		[302] = "Found",
+		[303] = "See Other",
+		[304] = "Not Modified",
+		[305] = "Use Proxy", -- Deprecated
+		[306] = "Unused", -- Unused
+		[307] = "Temporary Redirect",
+		[308] = "Permanent Redirect",
 
-	[400] = "Bad Request",
-	[401] = "Unauthorized",
-	[402] = "Payment Required",
-	[403] = "Forbidden",
-	[404] = "Not Found",
-	[405] = "Method Not Allowed",
-	[406] = "Not Acceptable",
-	[407] = "Proxy Authentication Required",
-	[408] = "Request Timeout",
-	[409] = "Conflict",
-	[410] = "Gone",
-	[411] = "Length Required",
-	[412] = "Precondition Failed",
-	[413] = "Payload Too Large",
-	[414] = "URI Too Long",
-	[415] = "Unsupported Media Type",
-	[416] = "Requested Range Not Satisfiable",
-	[417] = "Expectation Failed",
-	[418] = "I'm a teapot",
-	[421] = "Misdirected Request",
-	[422] = "Unprocessable Entity",
-	[423] = "Locked",
-	[424] = "Failed Dependency",
-	[425] = "Too Early",
-	[426] = "Upgrade Required",
-	[428] = "Precondition Required",
-	[429] = "Too Many Requests",
-	[431] = "Request Header Fields Too Large",
-	[451] = "Unavailable For Legal Reasons",
+		[400] = "Bad Request",
+		[401] = "Unauthorized",
+		[402] = "Payment Required",
+		[403] = "Forbidden",
+		[404] = "Not Found",
+		[405] = "Method Not Allowed",
+		[406] = "Not Acceptable",
+		[407] = "Proxy Authentication Required",
+		[408] = "Request Timeout",
+		[409] = "Conflict",
+		[410] = "Gone",
+		[411] = "Length Required",
+		[412] = "Precondition Failed",
+		[413] = "Payload Too Large",
+		[414] = "URI Too Long",
+		[415] = "Unsupported Media Type",
+		[416] = "Requested Range Not Satisfiable",
+		[417] = "Expectation Failed",
+		[418] = "I'm a teapot",
+		[421] = "Misdirected Request",
+		[422] = "Unprocessable Entity",
+		[423] = "Locked",
+		[424] = "Failed Dependency",
+		[425] = "Too Early",
+		[426] = "Upgrade Required",
+		[428] = "Precondition Required",
+		[429] = "Too Many Requests",
+		[431] = "Request Header Fields Too Large",
+		[451] = "Unavailable For Legal Reasons",
 
-	[500] = "Internal Server Error",
-	[501] = "Not Implemented",
-	[502] = "Bad Gateway",
-	[503] = "Service Unavailable",
-	[504] = "Gateway Timeout",
-	[505] = "HTTP Version Not Supported",
-	[506] = "Variant Also Negotiates",
-	[507] = "Insufficient Storage",
-	[508] = "Loop Detected",
-	[510] = "Not Extended",
-	[511] = "Network Authentication Required",
-}
+		[500] = "Internal Server Error",
+		[501] = "Not Implemented",
+		[502] = "Bad Gateway",
+		[503] = "Service Unavailable",
+		[504] = "Gateway Timeout",
+		[505] = "HTTP Version Not Supported",
+		[506] = "Variant Also Negotiates",
+		[507] = "Insufficient Storage",
+		[508] = "Loop Detected",
+		[510] = "Not Extended",
+		[511] = "Network Authentication Required",
+	}
 
-function http.status(code)
-	if not status_translate[code] then
-		return http.status(500) -- Return "500 Internal Server Error"
+	function http.status(code)
+		if not status_translate[code] then
+			return http.status(500) -- Return "500 Internal Server Error"
+		end
+		return format("%d %s", code, status_translate[code])
 	end
-	return format("%d %s", code, status_translate[code])
 end
 
 function http.server_version_string()
@@ -404,78 +533,6 @@ function http.parseurl(str)
 		params[key] = http.urldecode(value)
 	end
 	return params
-end
-
-function http.serve_file(path, mime)
-	local f = open(path, "r")
-	local document = f:read("*a")
-	if f then
-		f:close()
-		return 200, document, mime or "text/html"
-	end
-end
-
-function http.error_page(code, err)
-	local document = [[<html>
-<head><title>{status}</title>
-<style>.container{text-align:center;}.container pre{display:inline-block;text-align:left;}
-</style></head>
-<body>
-<center><h1>{status}</h1></center>
-<div class="container"><pre>{error}</pre></div>
-<hr><center>{server-version}</center>
-</body>
-</html>]]
-
-	-- Replace some keys with their values
-	document = document:gsub("%{error%}", err)
-	document = document:gsub("%{status%}", http.status(code))
-	document = document:gsub("%{server%-version%}", http.server_version_string())
-
-	return document
-end
-
-function http.status_page(code)
-	local document = [[<html>
-<head><title>{status}</title></head>
-<body>
-<center><h1>{status}</h1></center>
-<hr><center>{server-version}</center>
-</body>
-</html>]]
-
-	-- Replace some keys with their values
-	document = document:gsub("%{status%}", http.status(code))
-	document = document:gsub("%{server%-version%}", http.server_version_string())
-
-	return document
-end
-
-function http.create(ip, port)
-	local socket = assert(bind(ip, port))
-	socket:settimeout(0)
-
-	local ip, port = socket:getsockname()
-
-	log.info("http server started @%s:%i", ip, port)
-
-	local server = setmetatable({
-			ip = ip,
-			port = port,
-			socket = socket,
-			hooks = {},
-	}, SERVER)
-
-	-- Create an event using the sockets file desciptor for when client is ready to read data
-	server.onread = ev.IO.new(function()
-		local succ, err = xpcall(server.acceptclients, debug.traceback, server)
-		if not succ then log.error(err) end
-	end, server:getfd(), ev.READ)
-
-	-- Register the event
-	server.onread:start(ev.Loop.default)
-
-	return server
 end
 
 return http
